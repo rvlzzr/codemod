@@ -1,4 +1,4 @@
-// remix-to-tanstack-transformer.FINAL-v5.js
+// remix-to-tanstack-transformer.FINAL-v6.js
 
 export default function transformer(file, api) {
   const j = api.jscodeshift;
@@ -15,102 +15,125 @@ export default function transformer(file, api) {
     if (source.value === '@remix-run/react') source.value = '~/remix/react';
   });
 
-  // --- 2. NEW: Safely find all relevant top-level exports ---
-  // This new approach avoids crashing on `export type` statements.
-  let defaultExportPath = null;
-  let loaderExportPath = null;
-  let actionExportPath = null;
-
-  root.find(j.ExportDeclaration).forEach(path => {
-    // Find `export default ...`
-    if (path.node.type === 'ExportDefaultDeclaration') {
-      defaultExportPath = path;
-      return;
-    }
-
-    // Find `export function loader() {}` or `export function action() {}`
-    if (path.node.type === 'ExportNamedDeclaration' && path.node.declaration && path.node.declaration.type === 'FunctionDeclaration') {
-      const functionName = path.node.declaration.id.name;
-      if (functionName === 'loader') {
-        loaderExportPath = path;
-      } else if (functionName === 'action') {
-        actionExportPath = path;
+  // --- 2. NEW ROBUST DISCOVERY: Find declarations and their exports ---
+  // This helper finds the declaration (const or function) for a given name.
+  const findDeclaration = (name) => {
+    let declarationPath = null;
+    root.find(j.VariableDeclarator, { id: { name } }).forEach(path => { declarationPath = path; });
+    if (declarationPath) return declarationPath;
+    root.find(j.FunctionDeclaration, { id: { name } }).forEach(path => { declarationPath = path; });
+    return declarationPath;
+  };
+  
+  // This helper finds how a variable is exported.
+  const findExportPath = (name) => {
+      let exportPath = null;
+      // Find `export function/const loader ...`
+      root.find(j.ExportNamedDeclaration).forEach(path => {
+          if (path.node.declaration) {
+              const decl = path.node.declaration;
+              if (decl.type === 'FunctionDeclaration' && decl.id.name === name) exportPath = path;
+              if (decl.type === 'VariableDeclaration' && decl.declarations.some(d => d.id.name === name)) exportPath = path;
+          }
+      });
+      // Find `export { loader }`
+      if (!exportPath) {
+          root.find(j.ExportSpecifier, { exported: { name } }).forEach(path => { exportPath = path; });
       }
-    }
-  });
+      return exportPath;
+  };
 
-  // Exit if there's nothing for us to do
-  if (!defaultExportPath && !loaderExportPath && !actionExportPath) {
+  const loaderDeclarationPath = findDeclaration('loader');
+  const actionDeclarationPath = findDeclaration('action');
+  const defaultExportPath = root.find(j.ExportDefaultDeclaration).at(0); // This is a NodePath collection
+
+  // Exit if there's nothing to transform
+  if (defaultExportPath.length === 0 && !loaderDeclarationPath && !actionDeclarationPath) {
     return root.toSource();
   }
 
   // --- 3. LOGIC: Process as either a UI Route or an API Route ---
 
-  // CASE A: This is a UI-Centric File (it has a component)
-  if (defaultExportPath) {
+  // CASE A: This is a UI-Centric File
+  if (defaultExportPath.length > 0) {
     addTanstackImport('createFileRoute', '@tanstack/react-router');
-    const componentDeclaration = defaultExportPath.node.declaration;
+    const defaultExportNodePath = defaultExportPath.get(0);
+    let componentDeclaration = defaultExportNodePath.node.declaration;
+    
+    // Handle `export default MyComponentIdentifier`
+    if (componentDeclaration.type === 'Identifier') {
+        const componentName = componentDeclaration.name;
+        const foundDecl = findDeclaration(componentName);
+        if(foundDecl) componentDeclaration = foundDecl.node.init || foundDecl.node;
+    }
+
     const componentName = (componentDeclaration.id && componentDeclaration.id.name) || 'RouteComponent';
     const routeOptions = [j.property('init', j.identifier('component'), j.identifier(componentName))];
 
-    // Handle the loader: move it inside the Route definition
-    if (loaderExportPath) {
-      const loaderFunc = loaderExportPath.node.declaration;
+    // Handle the loader
+    if (loaderDeclarationPath) {
+      const loaderFuncBody = (loaderDeclarationPath.node.init || loaderDeclarationPath.node).body;
       const uiLoaderFunc = j.arrowFunctionExpression(
           [j.objectPattern([
               j.property('init', j.identifier('params'), j.identifier('params')),
               j.property('init', j.identifier('search'), j.identifier('search')),
           ])],
-          loaderFunc.body,
+          loaderFuncBody,
           true
       );
       routeOptions.unshift(j.property('init', j.identifier('loader'), uiLoaderFunc));
-      // Remove the original loader export
-      j(loaderExportPath).remove();
+      
+      // Remove original loader declaration and its export
+      j(loaderDeclarationPath).closest(j.VariableDeclarationStatement).remove();
+      j(loaderDeclarationPath).closest(j.FunctionDeclaration).remove();
+      const loaderExportPath = findExportPath('loader');
+      if(loaderExportPath) j(loaderExportPath).remove();
     }
 
-    // Handle the action: LEAVE IT ALONE, but add a TODO comment
-    if (actionExportPath) {
-      const comment = j.commentBlock(' TODO FIX THIS: This action needs to be refactored into a server function. ', true, false);
-      j(actionExportPath).insertBefore(comment);
+    // Handle the action: add a TODO comment
+    if (actionDeclarationPath) {
+      const actionExportPath = findExportPath('action');
+      if (actionExportPath) {
+         const comment = j.commentBlock(' TODO FIX THIS: This action needs to be refactored into a server function. ', true, false);
+         j(actionExportPath).insertBefore(comment);
+      }
     }
     
-    // Assemble and add the new UI Route definition
-    const uiRouteDeclaration = j.exportNamedDeclaration(
-      j.variableDeclaration('const', [
-        j.variableDeclarator(j.identifier('Route'), j.callExpression(j.identifier('createFileRoute'), [j.objectExpression(routeOptions)]))
-      ])
-    );
+    // Assemble the new UI Route
+    const uiRouteDeclaration = j.exportNamedDeclaration(j.variableDeclaration('const', [j.variableDeclarator(j.identifier('Route'), j.callExpression(j.identifier('createFileRoute'), [j.objectExpression(routeOptions)]))]));
     root.get().node.program.body.push(uiRouteDeclaration);
 
-    // Replace the default export with a standard named function/component
-    if (componentDeclaration.id) {
-        j(defaultExportPath).replaceWith(componentDeclaration);
-    } else {
-        j(defaultExportPath).replaceWith(j.functionDeclaration(j.identifier(componentName), componentDeclaration.params, componentDeclaration.body.type === 'BlockStatement' ? componentDeclaration.body : j.blockStatement([j.returnStatement(componentDeclaration.body)])));
+    // Cleanup the old default export and its declaration if needed
+    if (componentDeclaration.id) { // It was a named function/const
+        const componentDeclPath = findDeclaration(componentDeclaration.id.name);
+        if (componentDeclPath) j(componentDeclPath).closest(j.VariableDeclarationStatement).remove();
     }
+    j(defaultExportNodePath).replaceWith(j.functionDeclaration(j.identifier(componentName), componentDeclaration.params, componentDeclaration.body));
 
-  // CASE B: This is an API-Only File (no component)
+  // CASE B: This is an API-Only File
   } else {
     addTanstackImport('createServerFileRoute', '@tanstack/start/server');
     const serverMethods = [];
-    if (loaderExportPath) {
-        const loaderFunc = loaderExportPath.node.declaration;
+
+    if (loaderDeclarationPath) {
+        const loaderFunc = loaderDeclarationPath.node.init || loaderDeclarationPath.node;
         serverMethods.push(j.property('init', j.identifier('GET'), loaderFunc));
-        j(loaderExportPath).remove();
+        j(loaderDeclarationPath).closest(j.VariableDeclarationStatement).remove();
+        j(loaderDeclarationPath).closest(j.FunctionDeclaration).remove();
+        const loaderExportPath = findExportPath('loader');
+        if(loaderExportPath) j(loaderExportPath).remove();
     }
-    if (actionExportPath) {
-        const actionFunc = actionExportPath.node.declaration;
+    if (actionDeclarationPath) {
+        const actionFunc = actionDeclarationPath.node.init || actionDeclarationPath.node;
         serverMethods.push(j.property('init', j.identifier('POST'), actionFunc));
-        j(actionExportPath).remove();
+        j(actionDeclarationPath).closest(j.VariableDeclarationStatement).remove();
+        j(actionDeclarationPath).closest(j.FunctionDeclaration).remove();
+        const actionExportPath = findExportPath('action');
+        if(actionExportPath) j(actionExportPath).remove();
     }
 
     if (serverMethods.length > 0) {
-        const serverRouteDeclaration = j.exportNamedDeclaration(
-            j.variableDeclaration('const', [
-                j.variableDeclarator(j.identifier('ServerRoute'), j.callExpression(j.memberExpression(j.callExpression(j.identifier('createServerFileRoute'), []), j.identifier('methods')), [j.objectExpression(serverMethods)]))
-            ])
-        );
+        const serverRouteDeclaration = j.exportNamedDeclaration(j.variableDeclaration('const', [j.variableDeclarator(j.identifier('ServerRoute'), j.callExpression(j.memberExpression(j.callExpression(j.identifier('createServerFileRoute'), []), j.identifier('methods')), [j.objectExpression(serverMethods)]))]));
         root.get().node.program.body.push(serverRouteDeclaration);
     }
   }
@@ -126,6 +149,9 @@ export default function transformer(file, api) {
       const specifiers = importsToAdd[path].map(name => j.importSpecifier(j.identifier(name)));
       root.get().node.program.body.unshift(j.importDeclaration(specifiers, j.literal(path)));
   });
+
+  // Clean up empty export blocks like `export {}`
+  root.find(j.ExportNamedDeclaration).filter(path => path.node.specifiers.length === 0 && !path.node.declaration).remove();
 
   return root.toSource({ quote: 'single' });
 }
