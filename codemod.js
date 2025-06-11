@@ -1,4 +1,4 @@
-// remix-to-tanstack-transformer.FINAL-v8.js
+// remix-to-tanstack-transformer.FINAL-v9.js
 
 export default function transformer(file, api) {
   const j = api.jscodeshift;
@@ -24,21 +24,6 @@ export default function transformer(file, api) {
     }
     return declPath;
   };
-  
-  const findExportPath = (name) => {
-      let exportPath = null;
-      root.find(j.ExportNamedDeclaration).forEach(path => {
-          if (path.node.declaration) {
-              const decl = path.node.declaration;
-              if (decl.type === 'FunctionDeclaration' && decl.id.name === name) exportPath = path;
-              if (decl.type === 'VariableDeclaration' && decl.declarations.some(d => d.id.name === name)) exportPath = path;
-          }
-      });
-      if (!exportPath) {
-          root.find(j.ExportSpecifier, { exported: { name } }).forEach(path => { exportPath = path; });
-      }
-      return exportPath;
-  };
 
   const loaderDeclarationPath = findDeclaration('loader');
   const actionDeclarationPath = findDeclaration('action');
@@ -47,7 +32,7 @@ export default function transformer(file, api) {
   if (defaultExportPathCollection.length === 0 && !loaderDeclarationPath && !actionDeclarationPath) {
     return root.toSource({ quote: 'single' });
   }
-
+  
   // --- 3. LOGIC: Process as either a UI Route or an API Route ---
 
   // CASE A: This is a UI-Centric File
@@ -57,6 +42,7 @@ export default function transformer(file, api) {
     const defaultExportNodePath = defaultExportPath.get(0);
     let componentDeclaration = defaultExportNodePath.node.declaration;
     
+    // Handle `export default MyComponentIdentifier` by finding its declaration
     if (componentDeclaration.type === 'Identifier') {
         const decl = findDeclaration(componentDeclaration.name);
         if (decl) componentDeclaration = decl.node.init || decl.node;
@@ -79,29 +65,36 @@ export default function transformer(file, api) {
       routeOptions.unshift(j.property('init', j.identifier('loader'), uiLoaderFunc));
     }
 
-    // Handle the action: add a TODO comment
+    // Handle the action: Safely add a TODO comment to the declaration
     if (actionDeclarationPath) {
-      const actionExportPath = findExportPath('action');
-      if (actionExportPath) {
-         const comment = j.commentBlock(' TODO FIX THIS: This action needs to be refactored into a server function. ', true, false);
-         j(actionExportPath).insertBefore(comment);
-      }
+        const comment = j.commentBlock(' TODO FIX THIS: This action needs to be refactored into a server function. ', true, false);
+        j(actionDeclarationPath).closest(j.Statement).insertBefore(comment);
     }
     
     // Assemble the new UI Route
     const uiRouteDeclaration = j.exportNamedDeclaration(j.variableDeclaration('const', [j.variableDeclarator(j.identifier('Route'), j.callExpression(j.identifier('createFileRoute'), [j.objectExpression(routeOptions)]))]));
     root.get().node.program.body.push(uiRouteDeclaration);
 
-    // ✅ SAFER CLEANUP for the component
-    // Replace the `export default ...` with a standard `function ...` in one atomic step.
-    const newComponentFunction = j.functionDeclaration(j.identifier(componentName), componentDeclaration.params, componentDeclaration.body);
+    // ✅ SAFER Component Creation
+    // This handles arrow functions with implicit returns (e.g. `() => <div />`)
+    const body = componentDeclaration.body.type === 'BlockStatement'
+          ? componentDeclaration.body
+          : j.blockStatement([j.returnStatement(componentDeclaration.body)]);
+          
+    const newComponentFunction = j.functionDeclaration(j.identifier(componentName), componentDeclaration.params, body);
     defaultExportPath.replaceWith(newComponentFunction);
 
-    // If the original component was a variable, remove its declaration statement
+    // If the original component was a variable that was NOT exported by name, remove it.
     if (componentDeclaration.id) {
         const originalCompDecl = findDeclaration(componentDeclaration.id.name);
-        if(originalCompDecl) j(originalCompDecl).closest(j.Statement).remove();
+        if(originalCompDecl) {
+            const isExported = j(originalCompDecl).closest(j.ExportNamedDeclaration).length > 0;
+            if (!isExported) {
+                j(originalCompDecl).closest(j.Statement).remove();
+            }
+        }
     }
+
     // Remove the original loader (now that its body has been copied)
     if (loaderDeclarationPath) {
       j(loaderDeclarationPath).closest(j.Statement).remove();
@@ -127,14 +120,9 @@ export default function transformer(file, api) {
         root.get().node.program.body.push(serverRouteDeclaration);
         
         // Cleanup for API routes
-        if (loaderDeclarationPath) {
-            j(loaderDeclarationPath).closest(j.Statement).remove();
-            root.find(j.ExportSpecifier, { exported: { name: 'loader' } }).remove();
-        }
-        if (actionDeclarationPath) {
-            j(actionDeclarationPath).closest(j.Statement).remove();
-            root.find(j.ExportSpecifier, { exported: { name: 'action' } }).remove();
-        }
+        if (loaderDeclarationPath) j(loaderDeclarationPath).closest(j.Statement).remove();
+        if (actionDeclarationPath) j(actionDeclarationPath).closest(j.Statement).remove();
+        root.find(j.ExportSpecifier, { exported: { name: (n) => n === 'loader' || n === 'action' } }).remove();
     }
   }
 
