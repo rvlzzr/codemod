@@ -1,15 +1,3 @@
-/**
- * jscodeshift codemod: Convert Remix loaders → TanStack Router createFileRoute loaders
- *
- * - Replaces `export const loader = ...` with `export const Route = createFileRoute(...)`
- * - Unwraps data from Remix's `json()` helper.
- * - Removes the associated `json` import.
- * - Preserves the original position of the loader in the file.
- *
- * Usage:
- * jscodeshift -t remix-to-tanstack-loader.js 'app/routes/**/*.{ts,tsx,js,jsx}'
- */
-
 export default function transformer(file, api) {
   const j = api.jscodeshift;
   const root = j(file.source);
@@ -68,19 +56,31 @@ export default function transformer(file, api) {
       }
     });
 
-  // 5) NEW: Clean up the `json` import from any `@remix-run/*` package.
+  // 5) NEW: Clean up `json` import and replace @remix-run/* paths.
   root.find(j.ImportDeclaration, {
     source: { value: v => /@remix-run\/(node|react|server-runtime)/.test(v) }
   }).forEach(path => {
+    const sourceValue = path.node.source.value;
+
+    // Part A: Clean up the `json` import specifier
     const remainingSpecifiers = path.node.specifiers.filter(
       s => !(s.type === 'ImportSpecifier' && s.imported.name === 'json')
     );
 
-    if (remainingSpecifiers.length > 0) {
-      path.node.specifiers = remainingSpecifiers;
-    } else {
-      // If no specifiers are left, remove the entire import declaration.
+    // If `json` was the only thing imported, remove the entire import statement.
+    if (remainingSpecifiers.length === 0) {
       j(path).remove();
+      return; // Continue to next import declaration
+    }
+    
+    // Otherwise, update the specifiers list.
+    path.node.specifiers = remainingSpecifiers;
+
+    // Part B: Replace the source path to the polyfill location
+    if (sourceValue === '@remix-run/node') {
+        path.node.source = j.stringLiteral('~/remix/node');
+    } else if (sourceValue === '@remix-run/react') {
+        path.node.source = j.stringLiteral('~/remix/react');
     }
   });
 
