@@ -48,23 +48,33 @@ function findNamedExport(j, root, name) {
 
 /**
  * Extracts a function expression from an export declaration path.
+ * This function is now much more robust to prevent crashes.
  */
-function extractFunctionExpression(j, collection) {
+function extractFunctionExpression(j, collection, name) {
     if (collection.size() === 0) return null;
 
     const exportPath = collection.get();
+    if (!exportPath || !exportPath.node) return null;
+
     const decl = exportPath.node.declaration;
+    if (!decl) return null;
+
     let fnExpr;
 
     if (decl.type === 'FunctionDeclaration') {
+        if (!decl.body) return null; // Guard against invalid AST
         fnExpr = j.arrowFunctionExpression(decl.params, decl.body, false);
         fnExpr.async = decl.async;
-    } else { // VariableDeclaration
-        const varDeclarator = decl.declarations.find(d => d.id.name === 'loader' || d.id.name === 'action');
+    } else if (decl.type === 'VariableDeclaration') {
+        if (!decl.declarations) return null;
+        const varDeclarator = decl.declarations.find(d => d.id.name === name);
+        if (!varDeclarator || !varDeclarator.init) return null;
         fnExpr = varDeclarator.init;
+    } else {
+        return null; // Don't know how to handle this declaration type
     }
 
-    // Unwrap json() calls
+    // Unwrap json() calls from the function body
     j(fnExpr)
         .find(j.CallExpression, { callee: { name: 'json' } })
         .forEach(path => {
@@ -143,7 +153,9 @@ function cleanRemixImports(j, root) {
  * Transforms a UI route with a loader.
  */
 function transformUiRoute(j, root, loaderCollection, filePath) {
-    const loaderFnExpr = extractFunctionExpression(j, loaderCollection);
+    const loaderFnExpr = extractFunctionExpression(j, loaderCollection, 'loader');
+    if (!loaderFnExpr) return; // Skip if function extraction failed
+
     const routePath = computeRoutePath(filePath);
     ensureImport(j, root, 'createFileRoute', '@tanstack/react-router');
 
@@ -176,12 +188,12 @@ function transformUiRoute(j, root, loaderCollection, filePath) {
 function transformApiRoute(j, root, loaderCollection, actionCollection, filePath) {
     const methods = [];
 
-    const loaderFnExpr = extractFunctionExpression(j, loaderCollection);
+    const loaderFnExpr = extractFunctionExpression(j, loaderCollection, 'loader');
     if (loaderFnExpr) {
         methods.push(j.property('init', j.identifier('GET'), loaderFnExpr));
     }
 
-    const actionFnExpr = extractFunctionExpression(j, actionCollection);
+    const actionFnExpr = extractFunctionExpression(j, actionCollection, 'action');
     if (actionFnExpr) {
         methods.push(j.property('init', j.identifier('POST'), actionFnExpr));
     }
@@ -211,9 +223,16 @@ function transformApiRoute(j, root, loaderCollection, actionCollection, filePath
             )
         ])
     );
+    
+    // NEW: Replace the first found export, and remove any others.
+    // This is safer than removing both and handles shared export statements.
+    const allPaths = [...loaderCollection.paths(), ...actionCollection.paths()];
+    const uniquePaths = [...new Set(allPaths)];
 
-    // Remove old exports and add the new one at the end
-    loaderCollection.remove();
-    actionCollection.remove();
-    root.get().program.body.push(serverRouteDecl);
+    if (uniquePaths.length > 0) {
+        j(uniquePaths[0]).replaceWith(serverRouteDecl);
+        for (let i = 1; i < uniquePaths.length; i++) {
+            j(uniquePaths[i]).remove();
+        }
+    }
 }
