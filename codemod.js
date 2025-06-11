@@ -1,3 +1,4 @@
+
 export default function transformer(file, api) {
     const j = api.jscodeshift;
     const root = j(file.source);
@@ -5,26 +6,40 @@ export default function transformer(file, api) {
     const hasDefaultExport = root.find(j.ExportDefaultDeclaration).size() > 0;
     const loaderCollection = findNamedExport(j, root, 'loader');
     const actionCollection = findNamedExport(j, root, 'action');
+    const shouldRevalidateCollection = findNamedExport(j, root, 'shouldRevalidate');
 
     // Nothing to process
-    if (loaderCollection.size() === 0 && actionCollection.size() === 0) {
+    if (
+        loaderCollection.size() === 0 &&
+        actionCollection.size() === 0 &&
+        shouldRevalidateCollection.size() === 0
+    ) {
         return null;
     }
 
     // Process all `@remix-run/*` imports first
     cleanRemixImports(j, root);
 
+    // NEW: Handle and remove shouldRevalidate without leaving a comment
+    if (shouldRevalidateCollection.size() > 0) {
+        shouldRevalidateCollection.remove();
+    }
+
     if (hasDefaultExport) {
         // --- Case 1: This is a UI Route. We only care about the loader. ---
         if (loaderCollection.size() === 0) {
-            return null; // No loader to migrate
+            // If there's no loader but there was a shouldRevalidate, we might have modified the file.
+            return shouldRevalidateCollection.size() > 0 ? root.toSource({ quote: 'single', trailingComma: true }) : null;
         }
         transformUiRoute(j, root, loaderCollection, file.path);
     } else {
         // --- Case 2: This is an API Route. Process loader and/or action. ---
-        transformApiRoute(j, root, loaderCollection, actionCollection, file.path);
+        if (loaderCollection.size() > 0 || actionCollection.size() > 0) {
+            transformApiRoute(j, root, loaderCollection, actionCollection, file.path);
+        }
     }
 
+    // If we've made changes, return the new source code.
     return root.toSource({ quote: 'single', trailingComma: true });
 }
 
@@ -48,7 +63,6 @@ function findNamedExport(j, root, name) {
 
 /**
  * Extracts a function expression from an export declaration path.
- * This function is now much more robust to prevent crashes.
  */
 function extractFunctionExpression(j, collection, name) {
     if (collection.size() === 0) return null;
@@ -224,8 +238,7 @@ function transformApiRoute(j, root, loaderCollection, actionCollection, filePath
         ])
     );
     
-    // NEW: Replace the first found export, and remove any others.
-    // This is safer than removing both and handles shared export statements.
+    // Replace the first found export, and remove any others.
     const allPaths = [...loaderCollection.paths(), ...actionCollection.paths()];
     const uniquePaths = [...new Set(allPaths)];
 
