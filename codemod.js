@@ -1,4 +1,3 @@
-
 export default function transformer(file, api) {
     const j = api.jscodeshift;
     const root = j(file.source);
@@ -20,7 +19,7 @@ export default function transformer(file, api) {
     // Process all `@remix-run/*` imports first
     cleanRemixImports(j, root);
 
-    // NEW: Handle and remove shouldRevalidate without leaving a comment
+    // Handle and remove shouldRevalidate without leaving a comment
     if (shouldRevalidateCollection.size() > 0) {
         shouldRevalidateCollection.remove();
     }
@@ -31,7 +30,8 @@ export default function transformer(file, api) {
             // If there's no loader but there was a shouldRevalidate, we might have modified the file.
             return shouldRevalidateCollection.size() > 0 ? root.toSource({ quote: 'single', trailingComma: true }) : null;
         }
-        transformUiRoute(j, root, loaderCollection, file.path);
+        // MODIFIED: This function now implements the server function pattern.
+        transformUiRouteWithServerFn(j, root, loaderCollection, file.path);
     } else {
         // --- Case 2: This is an API Route. Process loader and/or action. ---
         if (loaderCollection.size() > 0 || actionCollection.size() > 0) {
@@ -42,6 +42,76 @@ export default function transformer(file, api) {
     // If we've made changes, return the new source code.
     return root.toSource({ quote: 'single', trailingComma: true });
 }
+
+
+// --- MODIFIED `transformUiRoute` is now `transformUiRouteWithServerFn` ---
+/**
+ * Transforms a UI route by creating a `createServerFn` for the loader
+ * and a `createFileRoute` that calls it.
+ */
+function transformUiRouteWithServerFn(j, root, loaderCollection, filePath) {
+    const loaderFnExpr = extractFunctionExpression(j, loaderCollection, 'loader');
+    if (!loaderFnExpr) return; // Skip if function extraction failed
+
+    const routePath = computeRoutePath(filePath);
+
+    // 1. Ensure all necessary imports are present
+    ensureImport(j, root, 'createFileRoute', '@tanstack/react-router');
+    ensureImport(j, root, 'createServerFn', '@tanstack/react-start');
+
+    // 2. Create the server function declaration
+    // export const loaderFn = createServerFn('GET').handler(async ({ params, ... }) => { ... })
+    const serverFnIdentifier = j.identifier('loaderFn'); // Use a distinct name
+    const serverFnDecl = j.exportNamedDeclaration(
+        j.variableDeclaration('const', [
+            j.variableDeclarator(
+                serverFnIdentifier,
+                j.callExpression(
+                    j.memberExpression(
+                        j.callExpression(j.identifier('createServerFn'), [j.stringLiteral('GET')]),
+                        j.identifier('handler')
+                    ),
+                    [loaderFnExpr]
+                )
+            )
+        ])
+    );
+
+    // 3. Create the client-side loader that calls the server function
+    // loader: async (context) => loaderFn(context)
+    const contextIdentifier = j.identifier('context');
+    const clientLoader = j.arrowFunctionExpression(
+        [contextIdentifier],
+        j.callExpression(serverFnIdentifier, [contextIdentifier])
+    );
+    clientLoader.async = true;
+
+    // 4. Create the main Route declaration
+    const routeDecl = j.exportNamedDeclaration(
+        j.variableDeclaration('const', [
+            j.variableDeclarator(
+                j.identifier('Route'),
+                j.callExpression(
+                    j.callExpression(
+                        j.identifier('createFileRoute'),
+                        [j.stringLiteral(routePath)]
+                    ),
+                    [
+                        j.objectExpression([
+                            j.property('init', j.identifier('loader'), clientLoader)
+                        ])
+                    ]
+                )
+            )
+        ])
+    );
+
+    // 5. Replace the old loader export with BOTH the new server function and the new Route export
+    j(loaderCollection.get()).replaceWith([serverFnDecl, routeDecl]);
+}
+
+
+// --- All other helper functions remain the same ---
 
 /**
  * Finds a named export, whether it's a function or a variable declaration.
@@ -162,40 +232,6 @@ function cleanRemixImports(j, root) {
     });
 }
 
-
-/**
- * Transforms a UI route with a loader.
- */
-function transformUiRoute(j, root, loaderCollection, filePath) {
-    const loaderFnExpr = extractFunctionExpression(j, loaderCollection, 'loader');
-    if (!loaderFnExpr) return; // Skip if function extraction failed
-
-    const routePath = computeRoutePath(filePath);
-    ensureImport(j, root, 'createFileRoute', '@tanstack/react-router');
-
-    const routeDecl = j.exportNamedDeclaration(
-        j.variableDeclaration('const', [
-            j.variableDeclarator(
-                j.identifier('Route'),
-                j.callExpression(
-                    j.callExpression(
-                        j.identifier('createFileRoute'),
-                        [j.stringLiteral(routePath)]
-                    ),
-                    [
-                        j.objectExpression([
-                            j.property('init', j.identifier('loader'), loaderFnExpr)
-                        ])
-                    ]
-                )
-            )
-        ])
-    );
-
-    // Replace the old loader export with the new Route export
-    j(loaderCollection.get()).replaceWith(routeDecl);
-}
-
 /**
  * Transforms an API route with a loader and/or action.
  */
@@ -214,13 +250,15 @@ function transformApiRoute(j, root, loaderCollection, actionCollection, filePath
 
     if (methods.length === 0) return;
 
+    // This function doesn't exist in the original code, but is needed for API routes
+    // For this example, we assume `createServerFileRoute` is the right tool for API routes.
+    ensureImport(j, root, 'createServerFileRoute', '@tanstack/react-router'); 
     const routePath = computeRoutePath(filePath);
-    ensureImport(j, root, 'createServerFileRoute', '@tanstack/react-router');
 
     const serverRouteDecl = j.exportNamedDeclaration(
         j.variableDeclaration('const', [
             j.variableDeclarator(
-                j.identifier('ServerRoute'),
+                j.identifier('ServerRoute'), // Can be named anything
                 j.callExpression(
                     j.callExpression(
                         j.identifier('createServerFileRoute'),
