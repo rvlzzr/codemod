@@ -68,7 +68,14 @@ function transformUiRouteWithServerFn(j, root, loaderCollection, filePath) {
                 serverFnIdentifier,
                 j.callExpression(
                     j.memberExpression(
-                        j.callExpression(j.identifier('createServerFn'), [j.stringLiteral('GET')]),
+                        j.callExpression(
+                            j.identifier('createServerFn'),
+                            [
+                                j.objectExpression([
+                                    j.property('init', j.identifier('method'), j.stringLiteral('GET'))
+                                ])
+                            ]
+                        ),
                         j.identifier('handler')
                     ),
                     [loaderFnExpr]
